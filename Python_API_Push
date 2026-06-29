@@ -1,0 +1,232 @@
+"""
+remedy_ticket_update.py
+-----------------------
+Portfolio demonstration: BMC Remedy / Helix ITSM REST API integration.
+
+Demonstrates:
+  - OAuth2 client-credentials token acquisition with expiry tracking
+  - Automatic token refresh before expiration
+  - Retry logic with exponential back-off for transient failures
+  - PATCH request to update a Change Management ticket
+  - Structured logging and environment-variable-based credential management
+
+Author : Ben Sanders
+Context: Federal IT / DoD Change Management environment
+         (credentials sourced from .env; never hard-coded)
+"""
+
+import os
+import time
+import logging
+import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+load_dotenv()  # pulls from .env file in project root
+
+BASE_URL      = os.getenv("REMEDY_BASE_URL")        # e.g. https://itsm.agency.gov/api
+CLIENT_ID     = os.getenv("REMEDY_CLIENT_ID")
+CLIENT_SECRET = os.getenv("REMEDY_CLIENT_SECRET")
+TOKEN_URL     = os.getenv("REMEDY_TOKEN_URL")       # OAuth2 token endpoint
+
+MAX_RETRIES   = 3
+BACKOFF_BASE  = 2   # seconds; doubles each attempt (2, 4, 8 …)
+TOKEN_BUFFER  = 60  # refresh token this many seconds before it expires
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Token Manager
+# ---------------------------------------------------------------------------
+class TokenManager:
+    """
+    Manages OAuth2 bearer token lifecycle:
+      - Fetches a new token on first use
+      - Re-fetches automatically when the token is within TOKEN_BUFFER seconds
+        of expiry, avoiding mid-request 401 errors
+    """
+
+    def __init__(self):
+        self._token: str | None = None
+        self._expires_at: datetime = datetime.min
+
+    def get_token(self) -> str:
+        if self._is_expired():
+            self._fetch_token()
+        return self._token
+
+    def _is_expired(self) -> bool:
+        return datetime.utcnow() >= (self._expires_at - timedelta(seconds=TOKEN_BUFFER))
+
+    def _fetch_token(self) -> None:
+        log.info("Fetching new OAuth2 token …")
+        payload = {
+            "grant_type":    "client_credentials",
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+        resp = requests.post(TOKEN_URL, data=payload, timeout=15)
+        resp.raise_for_status()
+
+        data              = resp.json()
+        self._token       = data["access_token"]
+        expires_in        = int(data.get("expires_in", 3600))
+        self._expires_at  = datetime.utcnow() + timedelta(seconds=expires_in)
+
+        log.info("Token acquired; expires in %d seconds.", expires_in)
+
+
+# Module-level singleton — reused across all API calls in a session
+token_manager = TokenManager()
+
+
+# ---------------------------------------------------------------------------
+# Core API helper
+# ---------------------------------------------------------------------------
+def _api_request(
+    method: str,
+    endpoint: str,
+    payload: dict | None = None,
+) -> dict:
+    """
+    Sends an authenticated request to the Remedy REST API with retry logic.
+
+    Args:
+        method   : HTTP verb ("GET", "PATCH", "PUT", "POST")
+        endpoint : Path appended to BASE_URL (e.g. "/change/v1/changeRequests/{id}")
+        payload  : JSON body for write operations
+
+    Returns:
+        Parsed JSON response as a dict (empty dict for 204 No Content)
+
+    Raises:
+        requests.HTTPError after MAX_RETRIES failed attempts
+    """
+    url = f"{BASE_URL}{endpoint}"
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        headers = {
+            "Authorization": f"Bearer {token_manager.get_token()}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+        }
+
+        try:
+            log.info("[Attempt %d/%d] %s %s", attempt, MAX_RETRIES, method, url)
+            resp = requests.request(
+                method,
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+
+            # 401 → token may have been revoked mid-flight; force refresh and retry
+            if resp.status_code == 401 and attempt < MAX_RETRIES:
+                log.warning("401 Unauthorized — forcing token refresh.")
+                token_manager._expires_at = datetime.min
+                continue
+
+            resp.raise_for_status()
+
+            return resp.json() if resp.content else {}
+
+        except requests.RequestException as exc:
+            if attempt == MAX_RETRIES:
+                log.error("All %d attempts failed for %s %s", MAX_RETRIES, method, url)
+                raise
+            wait = BACKOFF_BASE ** attempt
+            log.warning("Request failed (%s). Retrying in %ds …", exc, wait)
+            time.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Domain-specific functions
+# ---------------------------------------------------------------------------
+def get_change_ticket(ticket_id: str) -> dict:
+    """Retrieve a Change Management ticket by its ID."""
+    endpoint = f"/change/v1/changeRequests/{ticket_id}"
+    ticket   = _api_request("GET", endpoint)
+    log.info("Retrieved ticket %s — Status: %s", ticket_id, ticket.get("status"))
+    return ticket
+
+
+def update_change_ticket(ticket_id: str, updates: dict) -> dict:
+    """
+    Patch a Change Management ticket with the provided field updates.
+
+    Common update fields:
+        status          : "In Progress" | "Completed" | "Cancelled"
+        work_notes      : Free-text audit trail entry
+        scheduled_start : ISO-8601 datetime string
+        scheduled_end   : ISO-8601 datetime string
+        assigned_group  : Assignment group name
+    """
+    endpoint = f"/change/v1/changeRequests/{ticket_id}"
+    result   = _api_request("PATCH", endpoint, payload=updates)
+    log.info("Ticket %s updated successfully.", ticket_id)
+    return result
+
+
+def add_work_note(ticket_id: str, note: str) -> dict:
+    """Append a timestamped work note to a ticket's audit trail."""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    payload   = {"work_notes": f"[{timestamp}] {note}"}
+    return update_change_ticket(ticket_id, payload)
+
+
+def close_change_ticket(ticket_id: str, close_notes: str) -> dict:
+    """
+    Mark a change ticket as Completed.
+    Mirrors the post-implementation review step in standard ITIL change workflow.
+    """
+    payload = {
+        "status":      "Completed",
+        "close_notes": close_notes,
+        "work_notes":  f"Ticket closed via automation on "
+                       f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    }
+    return update_change_ticket(ticket_id, payload)
+
+
+# ---------------------------------------------------------------------------
+# Demo entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    TICKET_ID = "CHG0012345"   # replace with a real ticket ID in your environment
+
+    # 1. Pull current state
+    ticket = get_change_ticket(TICKET_ID)
+    print("\n--- Current Ticket ---")
+    print(f"  ID       : {ticket.get('id')}")
+    print(f"  Summary  : {ticket.get('summary')}")
+    print(f"  Status   : {ticket.get('status')}")
+
+    # 2. Move to In Progress and log a work note
+    update_change_ticket(
+        TICKET_ID,
+        {
+            "status":     "In Progress",
+            "work_notes": "Automated status update: implementation phase started.",
+        },
+    )
+
+    # 3. Add a standalone work note (simulates a mid-change audit entry)
+    add_work_note(TICKET_ID, "Health checks passed; proceeding with deployment steps.")
+
+    # 4. Close the ticket
+    close_change_ticket(
+        TICKET_ID,
+        close_notes="Change implemented successfully. Post-implementation review complete.",
+    )
+
+    print("\nAll operations completed. Check Remedy/Helix for audit trail entries.")
