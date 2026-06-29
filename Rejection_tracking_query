@@ -1,0 +1,83 @@
+-- ============================================================
+-- Rejected Change Requests with Latest Rejection Notes
+-- Purpose: Surfaces rejected changes with the most recent
+--          rejection reason from the work log, used for
+--          coordinator follow-up and quality reporting.
+-- Author:  Ben Sanders
+-- ============================================================
+
+SELECT
+    cp.change_id                                                      AS "Change ID",
+    cp.impact                                                         AS "Impact",
+    cp.summary                                                        AS "Summary",
+    cp.coordinator                                                    AS "Change Coordinator",
+    cp.coordinator_id                                                 AS "Coordinator ID",
+    cp.coordinator_support_group                                      AS "Coordinator Support Group",
+    cp.coordinator_support_organization                               AS "Coordinator Support Org",
+    CONCAT(mgr.first_name, ' ', mgr.last_name)                       AS "HR Manager",
+    mgr.account                                                       AS "Manager ID",
+    TO_VARCHAR(cp.scheduled_start_date_time, 'MM/DD/YYYY HH12:MI:SS AM') AS "Scheduled Start Date",
+    TO_VARCHAR(cp.scheduled_end_date_time,   'MM/DD/YYYY HH12:MI:SS AM') AS "Scheduled End Date",
+    wl_latest.notes                                                   AS "Rejection Notes"
+
+FROM ITSM_PROD.SERVICE_MGMT.change_public cp
+
+    -- Resolve coordinator's HR worker record
+    LEFT JOIN HR.WORKFORCE_V worker
+        ON UPPER(cp.coordinator_id) = UPPER(worker.account)
+
+    -- Walk up to coordinator's manager
+    LEFT JOIN HR.WORKFORCE_V mgr
+        ON worker.manager_worker_id = mgr.worker_id
+
+    -- Subquery: pull only the most recent "Rejection Information" work log entry per change
+    LEFT JOIN (
+        SELECT
+            wl.change_id,
+            wl.work_info_type,
+            wl.submit_date_time,
+            wl.notes,
+            wl.submitter
+        FROM ITSM_PROD.SERVICE_MGMT.change_work_info_public wl
+        WHERE wl.work_info_type LIKE 'Rejection Information'
+          AND wl.submit_date_time = (
+              -- Correlated subquery: latest rejection log entry for this change
+              SELECT MAX(wl2.submit_date_time)
+              FROM ITSM_PROD.SERVICE_MGMT.change_work_info_public wl2
+              WHERE wl2.change_id       = wl.change_id
+                AND wl2.work_info_type LIKE 'Rejection Information'
+          )
+    ) wl_latest
+        ON cp.change_id = wl_latest.change_id
+
+WHERE
+    -- Status filter
+    cp.status LIKE 'Rejected'
+
+    -- Scope to relevant support organizations
+    AND cp.coordinator_support_organization IN (
+        'Org_Alpha', 'Org_Beta', 'Org_Gamma', 'Org_Delta', 'Org_Epsilon'
+    )
+
+    -- Exclude automated/non-human coordinator groups
+    AND cp.coordinator_support_group NOT IN (
+        'Automation_Group', 'Excluded_Group_DEU'
+    )
+
+    -- Exclude specific system/service accounts
+    AND cp.coordinator_id NOT IN (
+        'svc_account1', 'svc_account2', 'svc_account3'
+    )
+
+    -- Limit to changes rejected by known reviewers (quality audit scope)
+    AND wl_latest.submitter IN (
+        'reviewer_01', 'reviewer_02', 'reviewer_03',
+        'reviewer_04', 'reviewer_05', 'reviewer_06',
+        'reviewer_07', 'reviewer_08', 'reviewer_09'
+    )
+
+    -- Rolling date filter: changes submitted on or after Jan 1 of current year
+    AND cp.submit_date_time > TO_DATE('2025-01-01', 'YYYY-MM-DD')
+
+ORDER BY cp.scheduled_start_date_time
+;
